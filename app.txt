@@ -1,0 +1,263 @@
+CIVIL CONCRETE - Aplikasi Perhitungan Beton Teknik Sipil
+==========================================================
+
+FILE: app.py
+DEPENDENSI:
+    pip install gradio pandas matplotlib openpyxl reportlab
+
+CARA MENJALANKAN:
+1. Pastikan Python sudah terpasang.
+2. Buka Command Prompt / Terminal pada folder yang berisi app.py.
+3. Jalankan perintah instalasi dependensi di atas.
+4. Jalankan aplikasi dengan:
+       python app.py
+5. Buka alamat lokal yang muncul di terminal (biasanya http://127.0.0.1:7860).
+
+FITUR:
+- Uji kuat tekan beton silinder dan kubus.
+- Perhitungan volume pelat, balok, kolom, fondasi, dan elemen lainnya.
+- Estimasi kebutuhan material berdasarkan komposisi input per m3.
+- Evaluasi nilai slump.
+- Estimasi biaya material.
+- Ekspor laporan Excel dan PDF.
+
+CATATAN TEKNIS:
+Modul campuran merupakan kalkulator proporsi berdasarkan input pengguna, bukan
+perancangan mix design SNI otomatis. Verifikasi seluruh asumsi, satuan, faktor,
+dan hasil terhadap SNI yang berlaku, spesifikasi proyek, serta arahan dosen/
+insinyur. Aplikasi ini merupakan alat bantu akademik dan bukan pengganti
+perencanaan serta pemeriksaan oleh tenaga ahli.
+
+KODE PYTHON LENGKAP:
+==========================================================
+
+"""
+CIVIL CONCRETE - Aplikasi Perhitungan Beton Teknik Sipil
+
+Instal dependensi:
+    pip install gradio pandas matplotlib openpyxl reportlab
+
+Jalankan:
+    python app.py
+
+Catatan:
+- Kalkulator proporsi material memakai input pengguna, bukan mix design SNI otomatis.
+- Verifikasi asumsi, satuan, hasil, dan ketentuan SNI yang berlaku sebelum digunakan
+  untuk pekerjaan konstruksi.
+"""
+
+import gradio as gr
+import pandas as pd
+import matplotlib.pyplot as plt
+import tempfile, os, math
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+
+# -------------------- UTILITAS --------------------
+def num(x, label):
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            raise ValueError()
+        return v
+    except Exception:
+        raise gr.Error(f"Masukkan angka yang valid untuk {label}.")
+
+def area_specimen(shape, d_or_side, h):
+    # Dimensi dalam mm; area tekan dalam mm2
+    x = num(d_or_side, "diameter/sisi")
+    if x <= 0:
+        raise gr.Error("Dimensi benda uji harus lebih besar dari nol.")
+    if shape == "Silinder":
+        return math.pi * x**2 / 4
+    return x**2
+
+def strength_calc(shape, dimension, height, load_kn):
+    load = num(load_kn, "beban maksimum")
+    if load <= 0:
+        raise gr.Error("Beban maksimum harus lebih besar dari nol.")
+    area = area_specimen(shape, dimension, height)
+    strength = load * 1000 / area  # kN -> N; N/mm2 = MPa
+    return area, strength
+
+def run_strength(shape, dimension, height, load, target):
+    area, fc = strength_calc(shape, dimension, height, load)
+    target = num(target, "mutu beton rencana")
+    status = "Memenuhi target input" if fc >= target else "Di bawah target input"
+    df = pd.DataFrame([{
+        "Bentuk benda uji": shape,
+        "Dimensi (mm)": float(dimension),
+        "Luas tekan (mm2)": round(area, 2),
+        "Beban maksimum (kN)": float(load),
+        "Kuat tekan (MPa)": round(fc, 3),
+        "Mutu target (MPa)": target,
+        "Evaluasi": status
+    }])
+    return f"### Hasil pengujian\\n**Kuat tekan = {fc:.3f} MPa**\\n\\nLuas tekan: {area:,.2f} mm²\\n\\nEvaluasi terhadap target yang dimasukkan: **{status}**", df
+
+def volume_calc(element, a, b, c, qty, waste):
+    a, b, c = num(a,"dimensi 1"), num(b,"dimensi 2"), num(c,"dimensi 3")
+    qty, waste = num(qty,"jumlah elemen"), num(waste,"persentase cadangan")
+    if min(a,b,c,qty) <= 0 or waste < 0:
+        raise gr.Error("Dimensi dan jumlah harus positif; cadangan tidak boleh negatif.")
+    # Semua dimensi input meter
+    if element == "Pelat / lantai / perkerasan":
+        v = a*b*c
+        formula = "panjang × lebar × tebal"
+    elif element == "Balok":
+        v = a*b*c
+        formula = "panjang × lebar × tinggi"
+    elif element == "Kolom":
+        v = a*b*c
+        formula = "lebar × tebal/sisi × tinggi"
+    elif element == "Fondasi telapak":
+        v = a*b*c
+        formula = "panjang × lebar × tebal/tinggi"
+    elif element == "Silinder / tiang bulat":
+        v = math.pi*(a/2)**2*b
+        formula = "π × (diameter/2)² × tinggi"
+    else:
+        v = a*b*c
+        formula = "panjang × lebar × tinggi"
+    base = v*qty
+    total = base*(1+waste/100)
+    return f"### Hasil volume\\nVolume geometris: **{base:.3f} m³**\\n\\nVolume + cadangan {waste:g}%: **{total:.3f} m³**\\n\\nRumus: {formula}", pd.DataFrame([{"Elemen":element,"Volume dasar (m3)":round(base,3),"Cadangan (%)":waste,"Jumlah akhir (m3)":round(total,3),"Jumlah elemen":qty}])
+
+def material_calc(volume, cement, sand, gravel, water, waste):
+    v = num(volume,"volume beton")
+    vals = [num(cement,"semen"),num(sand,"pasir"),num(gravel,"kerikil"),num(water,"air")]
+    w = num(waste,"cadangan")
+    if v <= 0 or min(vals) < 0 or w < 0:
+        raise gr.Error("Volume harus positif; komposisi dan cadangan tidak boleh negatif.")
+    vf = v*(1+w/100)
+    names = ["Semen (kg)","Pasir (kg)","Kerikil (kg)","Air (liter)"]
+    quantities = [vf*x for x in vals]
+    df = pd.DataFrame({"Material":names,"Kebutuhan per m3":vals,"Volume dihitung (m3)": [vf]*4,"Total kebutuhan": [round(x,2) for x in quantities]})
+    return f"### Estimasi kebutuhan material\\nVolume perhitungan termasuk cadangan: **{vf:.3f} m³**\\n\\n" + "\\n".join([f"- {n}: **{q:,.2f}**" for n,q in zip(names,quantities)]), df
+
+def cost_calc(df, pcement, psand, pgravel, pwater):
+    if df is None or len(df)==0:
+        raise gr.Error("Hitung kebutuhan material terlebih dahulu.")
+    prices = [num(pcement,"harga semen"),num(psand,"harga pasir"),num(pgravel,"harga kerikil"),num(pwater,"harga air")]
+    if min(prices)<0: raise gr.Error("Harga tidak boleh negatif.")
+    qty = df["Total kebutuhan"].astype(float).tolist()
+    # Air dianggap liter; harga air per liter. Material lain harga per kg.
+    total = sum(q*p for q,p in zip(qty,prices))
+    rows = pd.DataFrame({"Material":df["Material"],"Jumlah":qty,"Harga satuan (Rp)":prices,"Subtotal (Rp)":[q*p for q,p in zip(qty,prices)]})
+    return f"### Estimasi biaya material\\n**Rp {total:,.0f}**", rows
+
+def slump_note(slump, minv, maxv):
+    s,mn,mx = num(slump,"nilai slump"),num(minv,"batas bawah"),num(maxv,"batas atas")
+    if s < 0 or mn < 0 or mx < mn: raise gr.Error("Periksa nilai slump dan rentang target.")
+    status = "Dalam rentang target input" if mn <= s <= mx else "Di luar rentang target input"
+    return f"Nilai slump: **{s:g} mm**\\n\\nRentang target: {mn:g}–{mx:g} mm\\n\\nEvaluasi: **{status}**. Rentang target harus ditentukan dari spesifikasi pekerjaan."
+
+def export_files(strength_df, volume_df, material_df, cost_df):
+    frames = []
+    for name, df in [("Uji_Kuat_Tekan",strength_df),("Volume_Beton",volume_df),("Kebutuhan_Material",material_df),("Biaya_Material",cost_df)]:
+        if df is not None and len(df):
+            d=df.copy()
+            d.insert(0,"Kategori",name)
+            frames.append(d)
+    if not frames: raise gr.Error("Belum ada hasil untuk diekspor. Jalankan perhitungan terlebih dahulu.")
+    all_df = pd.concat(frames, ignore_index=True, sort=False)
+    xlsx = tempfile.NamedTemporaryFile(delete=False,suffix=".xlsx").name
+    with pd.ExcelWriter(xlsx,engine="openpyxl") as writer:
+        all_df.to_excel(writer,index=False,sheet_name="Rekap")
+        for name,df in [("Uji_Kuat_Tekan",strength_df),("Volume_Beton",volume_df),("Kebutuhan_Material",material_df),("Biaya_Material",cost_df)]:
+            if df is not None and len(df): df.to_excel(writer,index=False,sheet_name=name[:31])
+    pdf = tempfile.NamedTemporaryFile(delete=False,suffix=".pdf").name
+    styles=getSampleStyleSheet()
+    story=[Paragraph("LAPORAN CIVIL CONCRETE",styles["Title"]),Paragraph("Rekapitulasi perhitungan beton teknik sipil",styles["Normal"]),Spacer(1,12),Paragraph("Waktu pembuatan: "+datetime.now().strftime("%d-%m-%Y %H:%M"),styles["Normal"]),Spacer(1,12)]
+    for name,df in [("Uji Kuat Tekan",strength_df),("Volume Beton",volume_df),("Kebutuhan Material",material_df),("Biaya Material",cost_df)]:
+        if df is not None and len(df):
+            story.append(Paragraph(name,styles["Heading2"]))
+            data=[list(df.columns)]+df.astype(str).values.tolist()
+            t=Table(data,repeatRows=1)
+            t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#17365D")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.4,colors.grey),("FONTSIZE",(0,0),(-1,-1),7),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+            story.extend([t,Spacer(1,10)])
+    story.append(Spacer(1,8))
+    story.append(Paragraph("Catatan: hasil merupakan estimasi berdasarkan data dan asumsi input pengguna. Verifikasi dengan standar SNI, spesifikasi proyek, dan tenaga ahli.",styles["Italic"]))
+    SimpleDocTemplate(pdf,pagesize=A4,rightMargin=28,leftMargin=28,topMargin=32,bottomMargin=32).build(story)
+    return xlsx,pdf
+
+# -------------------- ANTARMUKA --------------------
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"),title="CIVIL CONCRETE") as demo:
+    gr.Markdown("# 🏗️ CIVIL CONCRETE")
+    gr.Markdown("**Aplikasi perhitungan beton untuk pekerjaan infrastruktur teknik sipil**  |  Google Colab + Python")
+    gr.Markdown("> Gunakan satuan yang diminta. Hasil bersifat alat bantu akademik dan estimasi awal, bukan pengganti desain struktur atau mix design sesuai SNI.")
+    with gr.Tab("🧪 Uji Kuat Tekan"):
+        with gr.Row():
+            shape=gr.Radio(["Silinder","Kubus"],value="Silinder",label="Bentuk benda uji")
+            dim=gr.Number(value=150,label="Diameter silinder / sisi kubus (mm)")
+            height=gr.Number(value=300,label="Tinggi silinder (mm) – tidak dipakai untuk kubus")
+        with gr.Row():
+            load=gr.Number(value=500,label="Beban maksimum (kN)")
+            target=gr.Number(value=25,label="Mutu beton target (MPa)")
+        btn=gr.Button("Hitung Kuat Tekan",variant="primary")
+        out_strength=gr.Markdown()
+        df_strength=gr.Dataframe(label="Data hasil uji",interactive=False)
+        btn.click(run_strength,[shape,dim,height,load,target],[out_strength,df_strength])
+    with gr.Tab("📐 Volume Beton"):
+        elem=gr.Dropdown(["Pelat / lantai / perkerasan","Balok","Kolom","Fondasi telapak","Silinder / tiang bulat"],value="Pelat / lantai / perkerasan",label="Jenis elemen")
+        with gr.Row():
+            a=gr.Number(value=10,label="Dimensi 1 / panjang (m)")
+            b=gr.Number(value=5,label="Dimensi 2 / lebar atau tinggi (m)")
+            c=gr.Number(value=0.15,label="Dimensi 3 / tebal (m)")
+            qty=gr.Number(value=1,label="Jumlah elemen")
+            waste=gr.Number(value=5,label="Cadangan (%)")
+        btnv=gr.Button("Hitung Volume",variant="primary")
+        out_volume=gr.Markdown()
+        df_volume=gr.Dataframe(label="Rekap volume",interactive=False)
+        btnv.click(volume_calc,[elem,a,b,c,qty,waste],[out_volume,df_volume])
+    with gr.Tab("🧱 Kebutuhan Material"):
+        gr.Markdown("Masukkan komposisi kebutuhan material **per 1 m³ beton** berdasarkan mix design/spesifikasi yang telah disetujui.")
+        with gr.Row():
+            vol=gr.Number(value=10,label="Volume beton (m³)")
+            mwaste=gr.Number(value=5,label="Cadangan (%)")
+        with gr.Row():
+            cement=gr.Number(value=350,label="Semen (kg/m³)")
+            sand=gr.Number(value=700,label="Pasir (kg/m³)")
+            gravel=gr.Number(value=1050,label="Kerikil (kg/m³)")
+            water=gr.Number(value=190,label="Air (liter/m³)")
+        btnm=gr.Button("Hitung Material",variant="primary")
+        out_material=gr.Markdown()
+        df_material=gr.Dataframe(label="Rekap kebutuhan material",interactive=False)
+        btnm.click(material_calc,[vol,cement,sand,gravel,water,mwaste],[out_material,df_material])
+    with gr.Tab("📏 Pengujian Slump"):
+        with gr.Row():
+            slump=gr.Number(value=100,label="Nilai slump (mm)")
+            smin=gr.Number(value=75,label="Batas bawah target (mm)")
+            smax=gr.Number(value=125,label="Batas atas target (mm)")
+        btns=gr.Button("Evaluasi Slump",variant="primary")
+        out_slump=gr.Markdown()
+        btns.click(slump_note,[slump,smin,smax],out_slump)
+    with gr.Tab("💰 Analisis Biaya"):
+        gr.Markdown("Jalankan tab Kebutuhan Material terlebih dahulu, lalu gunakan tabel hasilnya di bawah ini. Masukkan harga per kg untuk semen/pasir/kerikil dan per liter untuk air.")
+        cost_source=gr.Dataframe(label="Tempel atau masukkan tabel kebutuhan material dari hasil sebelumnya",headers=["Material","Kebutuhan per m3","Volume dihitung (m3)","Total kebutuhan"],datatype=["str","number","number","number"],row_count=4,col_count=(4,"fixed"))
+        with gr.Row():
+            pc=gr.Number(value=1500,label="Harga semen (Rp/kg)")
+            ps=gr.Number(value=300,label="Harga pasir (Rp/kg)")
+            pg=gr.Number(value=350,label="Harga kerikil (Rp/kg)")
+            pw=gr.Number(value=10,label="Harga air (Rp/liter)")
+        btnc=gr.Button("Hitung Biaya",variant="primary")
+        out_cost=gr.Markdown()
+        df_cost=gr.Dataframe(label="Rincian biaya",interactive=False)
+        btnc.click(cost_calc,[cost_source,pc,ps,pg,pw],[out_cost,df_cost])
+    with gr.Tab("📊 Ekspor Laporan"):
+        gr.Markdown("Ekspor hasil perhitungan yang tersedia. Untuk hasil dari tab lain, salin tabel hasil ke kolom yang sesuai.")
+        exp_strength=gr.Dataframe(label="Data kuat tekan",headers=["Bentuk benda uji","Dimensi (mm)","Luas tekan (mm2)","Beban maksimum (kN)","Kuat tekan (MPa)","Mutu target (MPa)","Evaluasi"],row_count=0)
+        exp_volume=gr.Dataframe(label="Data volume",row_count=0)
+        exp_material=gr.Dataframe(label="Data material",row_count=0)
+        exp_cost=gr.Dataframe(label="Data biaya",row_count=0)
+        btn_export=gr.Button("Buat Excel dan PDF",variant="primary")
+        file_xlsx=gr.File(label="Unduh Excel")
+        file_pdf=gr.File(label="Unduh PDF")
+        btn_export.click(export_files,[exp_strength,exp_volume,exp_material,exp_cost],[file_xlsx,file_pdf])
+    gr.Markdown("---\\n**CIVIL CONCRETE | Versi akademik awal**\\n\\nPengembangan berikutnya dapat menambahkan modul tulangan, desain campuran beton sesuai SNI, evaluasi statistik benda uji, balok/kolom/pelat struktural, dan database proyek.")
+
+if __name__ == "__main__":
+    demo.launch()
